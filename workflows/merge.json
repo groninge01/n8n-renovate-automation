@@ -1,0 +1,173 @@
+{
+  "name": "Merge queue",
+  "nodes": [
+    {
+      "id": "06c697a6-726f-464f-8698-0ff69e9f9fd2",
+      "name": "At :15 and :45",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        0
+      ],
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 15,45 * * * *"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "c8e87fb2-7a26-4b73-bdac-8ac5d620dd76",
+      "name": "Test manually",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        192
+      ],
+      "parameters": {}
+    },
+    {
+      "id": "cbaf3459-309d-4c95-b030-5eae54c3c4ef",
+      "name": "Run settings",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        240,
+        0
+      ],
+      "parameters": {
+        "jsCode": "return [{json:{mode:'merge',dryRun:true}}];"
+      }
+    },
+    {
+      "id": "76db2873-9d7e-4e59-9f40-3aefbad13779",
+      "name": "Load repository configuration",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.3,
+      "position": [
+        480,
+        0
+      ],
+      "parameters": {
+        "workflowId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "ak0UEUGVpmb1v6IR"
+        },
+        "options": {
+          "waitForSubWorkflow": true
+        }
+      }
+    },
+    {
+      "id": "fc53a22d-0c0c-4d49-be85-de00a19e826b",
+      "name": "Process each repository",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.3,
+      "position": [
+        960,
+        0
+      ],
+      "parameters": {
+        "workflowId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "tPQQRdoM1eYit8RV"
+        },
+        "workflowInputs": {
+          "mappingMode": "defineBelow",
+          "value": {},
+          "matchingColumns": [],
+          "schema": [],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": true
+        },
+        "mode": "each",
+        "options": {
+          "waitForSubWorkflow": true
+        }
+      }
+    },
+    {
+      "id": "5aaae040-3d09-46f3-8bef-8d7fc81a9b99",
+      "name": "Read me",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        0,
+        -320
+      ],
+      "parameters": {
+        "content": "## Merge queue\nActive at :15 and :45 every hour with real merging enabled. Each run merges at most one eligible PR per repository. There is no separate cooldown; manual runs can merge immediately.\n\nGitHub branch rules, current-head approvals, fresh CI checks, exact commit-SHA binding and repository locking remain enforced. Successful merges send a Discord embed with branch cleanup status and scheduled merge-check times.",
+        "height": 270,
+        "width": 1100
+      }
+    }
+  ],
+  "connections": {
+    "Test manually": {
+      "main": [
+        [
+          {
+            "node": "Run settings",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Run settings": {
+      "main": [
+        [
+          {
+            "node": "Load repository configuration",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Load repository configuration": {
+      "main": [
+        [
+          {
+            "node": "Process each repository",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "At :15 and :45": {
+      "main": [
+        [
+          {
+            "node": "Run settings",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "saveExecutionProgress": false,
+    "saveManualExecutions": false,
+    "saveDataErrorExecution": "all",
+    "saveDataSuccessExecution": "none",
+    "executionTimeout": 900,
+    "executionOrder": "v1",
+    "callerPolicy": "workflowsFromSameOwner",
+    "binaryMode": "separate",
+    "availableInMCP": true
+  },
+  "nodeGroups": [],
+  "id": "aRfT1C9xcQ51erdC",
+  "active": false
+}

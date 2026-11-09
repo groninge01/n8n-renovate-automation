@@ -1,0 +1,1203 @@
+{
+  "name": "PR policy and merge worker",
+  "nodes": [
+    {
+      "parameters": {
+        "inputSource": "passthrough"
+      },
+      "id": "f3751b8e-f425-4207-be10-39246234456e",
+      "name": "Run one repository",
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1.1,
+      "position": [
+        0,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "update",
+        "dataTableId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "aFuCiR0HLh6ntj2I"
+        },
+        "matchType": "allConditions",
+        "filters": {
+          "conditions": [
+            {
+              "keyValue": "={{ $json.rowId }}"
+            },
+            {
+              "keyName": "lockOwner"
+            }
+          ]
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "lockOwner": "={{ String($execution.id) }}"
+          },
+          "matchingColumns": [],
+          "schema": [
+            {
+              "id": "lockOwner",
+              "displayName": "lockOwner",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "id": "94ba2aa1-29e8-413e-8ebe-577d61f5a6d5",
+      "name": "Claim repository lock",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        240,
+        0
+      ],
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "jsCode": "const args=$('Run one repository').first().json;if($json.lockOwner!==String($execution.id))throw new Error('Repository lock not acquired');return [{json:{args,initialState:{repositories:{[args.repository]:JSON.parse($json.state||'{\"prs\":{},\"lastMerge\":null,\"outbox\":[]}')}},log:[]}}];"
+      },
+      "id": "f9547e63-fe7f-4846-bb6d-f113e9a65b28",
+      "name": "Initialize policy",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        480,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "function ciState(checks, statuses) {\n  const latest = new Map();\n  for (const c of checks) {\n    const k = `${c.app?.id}:${c.name}`;\n    if (!latest.has(k) || Number(c.id) > Number(latest.get(k).id)) latest.set(k, c);\n  }\n  const contexts = new Map();\n  for (const s of statuses) if (!contexts.has(s.context)) contexts.set(s.context, s);\n  const failures = [...latest.values()].filter(c => c.status === 'completed' && ['failure','timed_out','cancelled','action_required','startup_failure','stale'].includes(c.conclusion));\n  const badStatuses = [...contexts.values()].filter(s => ['failure','error'].includes(s.state));\n  const pending = [...latest.values()].some(c => c.status !== 'completed' || !['success','neutral','skipped','failure','timed_out','cancelled','action_required','startup_failure','stale'].includes(c.conclusion)) || [...contexts.values()].some(s => !['success','failure','error'].includes(s.state));\n  const hasSuccess = [...latest.values()].some(c => c.conclusion === 'success') || [...contexts.values()].some(s => s.state === 'success');\n  return { state: failures.length || badStatuses.length ? 'red' : pending || !hasSuccess ? 'pending' : 'green', failures, badStatuses };\n}\n\nclass Manager {\n  constructor({ config, github, state, save, notify }) {\n    Object.assign(this, { config, gh: github, state, save, notify });\n    this.locks = new Set();\n  }\n  record(repo) { return this.state.repositories[repo.name] ||= { prs: {}, lastMerge: null, outbox: [] }; }\n  persist() { this.save(this.state); }\n  event(repo, id, content) {\n    const record = this.record(repo);\n    if (!record.outbox.some(n => n.id === id)) record.outbox.push({ id, content, delivered: false });\n    this.persist();\n  }\n  async flush(repo) {\n    for (const item of this.record(repo).outbox.filter(x => !x.delivered)) {\n      await this.notify(item.content);\n      item.delivered = true;\n      this.persist();\n    }\n  }\n  async snapshot(repo, number) {\n    const pr = await this.gh.call(repo, `/pulls/${number}`);\n    const checks = await this.gh.pages(repo, `/commits/${pr.head.sha}/check-runs?filter=latest`, 'check_runs');\n    const statuses = await this.gh.pages(repo, `/commits/${pr.head.sha}/statuses`);\n    return { pr, ci: ciState(checks, statuses), checks };\n  }\n  eligible(repo, pr) { return pr.state === 'open' && !pr.draft && pr.user.login === repo.renovateLogin && pr.head.repo?.full_name === repo.name; }\n  prRecord(repo, pr) {\n    const record = this.record(repo);\n    return record.prs[`${pr.number}:${pr.head.sha}`] ||= { retries: {}, approved: false };\n  }\n  confirmApproval(repo, pr) {\n    this.prRecord(repo, pr).approved = true;\n    const id = `approved:${pr.number}`;\n    const recorded = this.record(repo).outbox.some(item => item.id === id || item.id.startsWith(id + ':'));\n    if (!recorded) this.event(repo, id, `✅ Approved ${repo.name} #${pr.number} — ${pr.title}\\n${pr.html_url}\\nAll observed CI checks passed. Commit: ${pr.head.sha}`);\n    else this.persist();\n  }\n  async monitorPr(repo, number, dryRun) {\n    const { pr, ci, checks } = await this.snapshot(repo, number);\n    const result = { number, title: pr.title, sha: pr.head.sha, ci: ci.state, url: pr.html_url };\n    if (!this.eligible(repo, pr)) return { ...result, action: 'skip' };\n    const record = this.prRecord(repo, pr);\n    if (ci.state === 'pending') return { ...result, action: 'wait' };\n    if (ci.state === 'green') {\n      const reviews = await this.gh.pages(repo, `/pulls/${number}/reviews`);\n      const appReview = reviews.filter(r => r.user?.login === this.config.appSlug + '[bot]' && ['APPROVED','CHANGES_REQUESTED','DISMISSED'].includes(r.state)).at(-1);\n      const appApproval = appReview?.state === 'APPROVED' && appReview.commit_id === pr.head.sha;\n      if (appApproval) { if (!dryRun) this.confirmApproval(repo, pr); return { ...result, action: 'already-approved' }; }\n      if (!dryRun) {\n        record.approved = false; this.persist();\n        const fresh = await this.gh.call(repo, `/pulls/${number}`);\n        if (fresh.head.sha !== pr.head.sha || !this.eligible(repo, fresh)) return { ...result, action: 'commit-changed' };\n        const pending = reviews.find(r => r.user?.login === this.config.appSlug + '[bot]' && r.state === 'PENDING' && r.commit_id === pr.head.sha);\n        const review = await this.gh.call(repo, pending ? `/pulls/${number}/reviews/${pending.id}/events` : `/pulls/${number}/reviews`, 'POST', { event: 'APPROVE', ...(pending ? {} : { commit_id: pr.head.sha }), body: 'All observed CI checks passed. Approved by the Renovate automation.' });\n        if (!review?.id || review.state !== 'APPROVED' || review.commit_id !== pr.head.sha || review.user?.login !== this.config.appSlug + '[bot]') throw new Error('GitHub did not confirm an APPROVED review for the inspected commit');\n        const confirmed = await this.gh.pages(repo, `/pulls/${number}/reviews`);\n        const latest = confirmed.filter(r => r.user?.login === this.config.appSlug + '[bot]' && ['APPROVED','CHANGES_REQUESTED','DISMISSED'].includes(r.state)).at(-1);\n        if (latest?.id !== review.id || latest.state !== 'APPROVED' || latest.commit_id !== pr.head.sha) throw new Error('GitHub approval read-back failed for the inspected commit');\n        this.confirmApproval(repo, pr);\n      }\n      return { ...result, action: dryRun ? 'would-approve' : 'approved' };\n    }\n    const runs = await this.gh.pages(repo, `/actions/runs?head_sha=${pr.head.sha}`, 'workflow_runs');\n    // Only retry runs associated with this PR or its exact source branch and commit.\n    const newest = new Map();\n    for (const r of runs.filter(r => r.head_sha === pr.head.sha && (r.pull_requests?.some(p => p.number === number) || r.head_branch === pr.head.ref))) {\n      const key = `${r.workflow_id}:${r.event}`;\n      if (!newest.has(key) || r.id > newest.get(key).id) newest.set(key, r);\n    }\n    const relevant = [...newest.values()];\n    const failed = relevant.filter(r => r.status === 'completed' && ['failure','timed_out','cancelled','action_required','startup_failure','stale'].includes(r.conclusion));\n    const actions = [];\n    for (const run of failed) {\n      const saved = record.retries[run.id];\n      if (saved) {\n        if ((run.run_attempt || 1) > saved.initialAttempt && !saved.notified) {\n          actions.push(`retry-failed:${run.id}`);\n          if (!dryRun) {\n            this.event(repo, `failed:${number}:${pr.head.sha}:${run.id}`, `❌ CI failed again: ${repo.name} #${number} — ${pr.title}\\n${pr.html_url}\\nWorkflow: ${run.name}\\n${run.html_url}`);\n            saved.notified = true; this.persist();\n          }\n        } else actions.push(`retry-already-requested:${run.id}`);\n        continue;\n      }\n      const fresh = await this.gh.call(repo, `/pulls/${number}`);\n      if (fresh.head.sha !== pr.head.sha || !this.eligible(repo, fresh)) return { ...result, action: 'commit-changed' };\n      actions.push(`retry-failed-jobs:${run.id}`);\n      if (!dryRun) {\n        // Persist intent before requesting a retry. An ambiguous network failure never causes an automatic second retry.\n        record.retries[run.id] = { initialAttempt: run.run_attempt || 1, requestedAt: new Date().toISOString(), notified: false };\n        this.persist();\n        try {\n          await this.gh.call(repo, `/actions/runs/${run.id}/rerun-failed-jobs`, 'POST', {});\n          record.retries[run.id].accepted = true; this.persist();\n        } catch (error) { if (error?.yieldEffect) throw error;\n          this.event(repo, `retry-error:${number}:${pr.head.sha}:${run.id}`, `⚠️ Could not confirm a CI retry for ${repo.name} #${number}. Please inspect the run; no second retry will be requested automatically.\\n${run.html_url}\\n${error.message}`);\n        }\n      }\n    }\n    const external = ci.failures.filter(c => c.app?.slug !== 'github-actions');\n    if (external.length || ci.badStatuses.length || (!failed.length && !relevant.some(r => r.status !== 'completed'))) {\n      actions.push('unretryable-check');\n      if (!dryRun) this.event(repo, `unretryable:${number}:${pr.head.sha}`, `⚠️ ${repo.name} #${number} has failing CI that could not be mapped to a completed GitHub Actions run.\\n${pr.html_url}\\nChecks: ${[...external.map(c=>c.name), ...ci.badStatuses.map(s=>s.context)].join(', ') || 'See PR checks'}`);\n    }\n    return { ...result, action: dryRun ? 'would-handle-failures' : 'handled-failures', details: actions };\n  }\n  async cleanup(repo) {\n    const record = this.record(repo);\n    const pending = record.pendingMerge;\n    if (!pending) return;\n    const pr = await this.gh.call(repo, `/pulls/${pending.number}`);\n    if (!pr.merged) {\n      if (pending.uncertain) throw new Error(`Merge outcome for #${pending.number} is still uncertain; inspect before continuing`);\n      delete record.pendingMerge; this.persist(); return;\n    }\n    record.lastMerge = pr.merged_at;\n    let deleted = false;\n    let cleanupFailed = false;\n    // Never delete a default branch, fork branch, or a branch whose tip changed since merging.\n    const metadata = await this.gh.call(repo, '');\n    if (pending.branch !== metadata.default_branch && pr.head.repo?.full_name === repo.name) {\n      try {\n        const ref = await this.gh.call(repo, `/git/ref/heads/${encodeURIComponent(pending.branch)}`);\n        if (ref.object.sha === pending.sha) { await this.gh.call(repo, `/git/refs/heads/${encodeURIComponent(pending.branch)}`, 'DELETE'); deleted = true; }\n      } catch (error) { if (error?.yieldEffect) throw error; if (error.status === 404) deleted = true; else { pending.cleanupError = error.message; cleanupFailed = true; } }\n    }\n    this.event(repo, `merged:${pending.number}:${pending.sha}`, `✅ Merged ${repo.name} #${pr.number} — ${pr.title}\\n${pr.html_url}\\nMethod: ${repo.mergeMethod}. Branch ${deleted ? 'deleted' : 'retained; deletion needs attention'}. Schedule: :15 and :45 each hour.`);\n    if (cleanupFailed) {\n      this.persist();\n      await this.flush(repo);\n      throw new Error('Merge succeeded, but branch deletion failed; cleanup will be retried before another merge');\n    }\n    delete record.pendingMerge; this.persist();\n  }\n  async merge(repo, dryRun) {\n    const record = this.record(repo);\n    if (!dryRun) await this.cleanup(repo);\n    const prs = await this.gh.pages(repo, '/pulls?state=open&sort=created&direction=asc');\n    for (const item of prs.filter(p => this.eligible(repo, p))) {\n      const { pr, ci } = await this.snapshot(repo, item.number);\n      if (!this.eligible(repo, pr) || ci.state !== 'green' || !pr.mergeable || pr.mergeable_state !== 'clean') continue;\n      const reviews = await this.gh.pages(repo, `/pulls/${pr.number}/reviews`);\n      const latestReviews = new Map();\n      for (const r of reviews) if (['APPROVED','CHANGES_REQUESTED','DISMISSED'].includes(r.state)) latestReviews.set(r.user.login, r);\n      if ([...latestReviews.values()].some(r => r.state === 'CHANGES_REQUESTED')) continue;\n      const appReview = latestReviews.get(this.config.appSlug+'[bot]');\n      if (appReview?.state !== 'APPROVED' || appReview.commit_id !== pr.head.sha) continue;\n      if (dryRun) return { action: 'would-merge', number: pr.number, sha: pr.head.sha, method: repo.mergeMethod };\n      const fresh = await this.snapshot(repo, pr.number);\n      if (fresh.pr.head.sha !== pr.head.sha || fresh.ci.state !== 'green' || fresh.pr.mergeable_state !== 'clean') continue;\n      record.pendingMerge = { number: pr.number, sha: pr.head.sha, branch: pr.head.ref, uncertain: true };\n      this.persist();\n      let result;\n      try { result = await this.gh.call(repo, `/pulls/${pr.number}/merge`, 'PUT', { sha: pr.head.sha, merge_method: repo.mergeMethod }); }\n      catch (error) { if (error?.yieldEffect) throw error;\n        if (error.status && error.status < 500) { delete record.pendingMerge; this.persist(); }\n        throw error;\n      }\n      if (!result.merged) { delete record.pendingMerge; this.persist(); return { action: 'merge-blocked', number: pr.number, message: result.message }; }\n      record.lastMerge = new Date().toISOString(); this.persist();\n      await this.cleanup(repo);\n      return { action: 'merged', number: pr.number, sha: result.sha };\n    }\n    return { action: 'no-eligible-pr' };\n  }\n  async run(mode, repoName, dryRun = true) {\n    const repo = this.config.repositories.find(r => r.name === repoName);\n    if (!repo) throw new Error('Repository is not configured');\n    if (this.locks.has(repo.name)) return { repository: repo.name, action: 'busy' };\n    this.locks.add(repo.name);\n    try {\n      let result;\n      if (!dryRun) { await this.cleanup(repo); await this.flush(repo); }\n      if (mode === 'monitor') {\n        const prs = await this.gh.pages(repo, '/pulls?state=open&sort=created&direction=asc');\n        result = [];\n        for (const pr of prs.filter(p => this.eligible(repo, p))) {\n          try { result.push(await this.monitorPr(repo, pr.number, dryRun)); }\n          catch (e) { if (e?.yieldEffect) throw e; result.push({ number: pr.number, action: 'error', error: e.message }); }\n        }\n      } else result = await this.merge(repo, dryRun);\n      if (!dryRun) await this.flush(repo);\n      return { repository: repo.name, dryRun, result };\n    } finally { this.locks.delete(repo.name); }\n  }\n}\n\n\n\n\n\nconst env=$input.first().json;\nconst state=JSON.parse(JSON.stringify(env.initialState));\nlet cursor=0;\nclass YieldEffect extends Error { constructor(effect){super('yield');this.yieldEffect=effect;} }\nfunction effect(value){\n  const previous=env.log[cursor++];\n  if(!previous)throw new YieldEffect(value);\n  if(JSON.stringify(previous.effect)!==JSON.stringify(value))throw new Error('Effect replay mismatch; lock retained for inspection');\n  const response=previous.response;\n  if(response.error || response.statusCode>=400){const e=new Error(response.safeMessage || ('API request failed: '+(response.statusCode||'network error')));e.status=response.statusCode;throw e;}\n  return response.body;\n}\nconst gh={\n  call:async(repo,path,method='GET',body)=>effect({kind:'github',path:'/repos/'+repo.name+path,method,...(body===undefined?{}:{body})}),\n  pages:async(repo,path,field)=>{const output=[];for(let page=1;page<=50;page++){const value=await gh.call(repo,path+(path.includes('?')?'&':'?')+'per_page=100&page='+page);const items=field?value[field]:value;if(!Array.isArray(items))throw new Error('Invalid paginated API result');output.push(...items);if(items.length<100)return output;}throw new Error('Pagination limit; refusing incomplete data');}\n};\nconst repo={name:env.args.repository,...env.args};\nconst manager=new Manager({config:{appSlug:env.args.appSlug,repositories:[repo]},github:gh,state,save:()=>{},notify:async content=>effect({kind:'discord',content:content.slice(0,1900).replace(/@/g,'@\\u200b')})});\ntry{\n  const result=await manager.run(env.args.mode,repo.name,env.args.dryRun);\n  return [{json:{...env,state,effect:{kind:'done'},result}}];\n}catch(error){\n  if(error.yieldEffect)return [{json:{...env,state,effect:error.yieldEffect}}];\n  return [{json:{...env,state,effect:{kind:'done'},fatal:error.message,result:{repository:repo.name,error:error.message}}}];\n}\n"
+      },
+      "id": "daa91595-2347-445b-abad-6b1fc72a2ab6",
+      "name": "Policy engine",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        720,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "update",
+        "dataTableId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "aFuCiR0HLh6ntj2I"
+        },
+        "matchType": "allConditions",
+        "filters": {
+          "conditions": [
+            {
+              "keyValue": "={{ $json.args.rowId }}"
+            },
+            {
+              "keyName": "lockOwner",
+              "keyValue": "={{ String($execution.id) }}"
+            }
+          ]
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "state": "={{ JSON.stringify($json.state.repositories[$json.args.repository]) }}"
+          },
+          "matchingColumns": [],
+          "schema": [
+            {
+              "id": "state",
+              "displayName": "state",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "id": "7815f457-8f85-4f11-84ee-7b11b8e568af",
+      "name": "Checkpoint durable state",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        960,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "return [{json:$('Policy engine').last().json}];"
+      },
+      "id": "1120d418-897a-4f72-b368-70ab9b5c71bb",
+      "name": "Restore policy context",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1200,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "cc0d9a1c-1943-42c5-bd50-c843cd2eb59e",
+              "leftValue": "={{ $json.effect.kind }}",
+              "rightValue": "done",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "c333619b-85b3-4079-8951-8923b0502bb2",
+      "name": "Finished?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1296,
+        -48
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "update",
+        "dataTableId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "aFuCiR0HLh6ntj2I"
+        },
+        "matchType": "allConditions",
+        "filters": {
+          "conditions": [
+            {
+              "keyValue": "={{ $json.args.rowId }}"
+            },
+            {
+              "keyName": "lockOwner",
+              "keyValue": "={{ String($execution.id) }}"
+            }
+          ]
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "lockOwner": "",
+            "lastResult": "={{ JSON.stringify($json.result) }}",
+            "lastRunAt": "={{ new Date().toISOString() }}"
+          },
+          "matchingColumns": [],
+          "schema": [
+            {
+              "id": "lockOwner",
+              "displayName": "lockOwner",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "lastResult",
+              "displayName": "lastResult",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "lastRunAt",
+              "displayName": "lastRunAt",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "id": "fbea893b-4097-4fa0-b8f1-8292afabe744",
+      "name": "Release repository lock",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        1680,
+        -160
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const s=$('Policy engine').last().json;if(s.fatal)throw new Error(s.fatal);return [{json:s.result}];"
+      },
+      "id": "ade55d0f-e964-4bb7-a538-7f5e2a194e05",
+      "name": "Result",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1920,
+        -160
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "b3a7fb63-f153-4d8e-8979-9a5aa6e52b7a",
+              "leftValue": "={{ $json.effect.kind }}",
+              "rightValue": "discord",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "3d6d416b-a4dc-4362-97c2-afbb0dc9a770",
+      "name": "Discord notification?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1664,
+        -96
+      ]
+    },
+    {
+      "parameters": {
+        "method": "={{ $json.effect.method }}",
+        "url": "={{ \"https://api.github.com\" + $json.effect.path }}",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "githubAppApi",
+        "options": {
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true,
+              "responseFormat": "json"
+            }
+          },
+          "timeout": 30000
+        }
+      },
+      "id": "58523d95-0c68-43c4-a2be-0577609600a0",
+      "name": "GitHub API request",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2048,
+        320
+      ],
+      "onError": "continueRegularOutput",
+      "credentials": {
+        "githubAppApi": {
+          "id": "RenoGhAppNative1",
+          "name": "Renovate — GitHub App"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "authentication": "webhook",
+        "resource": "webhook",
+        "operation": "sendLegacy",
+        "content": "",
+        "options": {
+          "wait": true
+        },
+        "embeds": {
+          "values": [
+            {
+              "inputMethod": "json",
+              "json": "={{ JSON.stringify((function formatDiscordNotification(content) {\n  const lines=content.split('\\n');\n  const heading=lines[0];\n  const prUrl=lines.find(line=>/^https:\\/\\/github\\.com\\/[^/]+\\/[^/]+\\/pull\\/\\d+$/.test(line));\n  const match=prUrl?.match(/^https:\\/\\/github\\.com\\/([^/]+\\/[^/]+)\\/pull\\/(\\d+)$/);\n  const repository=match?.[1];\n  const number=match?.[2];\n  const approved=heading.startsWith('✅ Approved');\n  const merged=heading.startsWith('✅ Merged');\n  const failed=heading.startsWith('❌');\n  const status=approved?'✅ Approved':merged?'🔀 Merged':failed?'❌ CI failed':'⚠️ Attention needed';\n  const title=heading.includes(' — ')?heading.slice(heading.indexOf(' — ')+3):undefined;\n  const fields=[];\n  if(repository)fields.push({name:'Repository',value:'['+repository+'](https://github.com/'+repository+')',inline:false});\n  if(approved)fields.push({name:'CI checks',value:'All passed',inline:true});\n  const sha=content.match(/Commit:\\s*([a-f0-9]{40})/i)?.[1];\n  if(sha&&repository)fields.push({name:'Commit',value:'[`'+sha.slice(0,7)+'`](https://github.com/'+repository+'/commit/'+sha+')',inline:true});\n  if(merged){\n    const method=content.match(/Method: ([^.]+)\\./)?.[1];\n    const branch=content.match(/Branch ([^.]+)\\./)?.[1];\n    if(method)fields.push({name:'Merge method',value:method,inline:true});\n    if(branch)fields.push({name:'Source branch',value:branch,inline:true});\n    fields.push({name:'Merge checks',value:':15 and :45 each hour',inline:false});\n  }\n  if(failed){\n    const workflow=lines.find(line=>line.startsWith('Workflow: '))?.slice(10);\n    const runUrl=lines.find(line=>/^https:\\/\\/github\\.com\\/.*\\/actions\\/runs\\//.test(line));\n    if(workflow)fields.push({name:'Failed workflow',value:runUrl?'['+workflow+']('+runUrl+')':workflow,inline:false});\n  }\n  const details=lines.slice(2).filter(line=>!line.startsWith('https://')).join('\\n');\n  return {\n    color:approved?0x57F287:merged?0x5865F2:failed?0xED4245:0xFEE75C,\n    title:(status+(number?' · PR #'+number:'')).slice(0,256),\n    ...(prUrl?{url:prUrl}:{}),\n    description:title?'**'+title.replace(/([\\\\*_`])/g,'\\\\$1')+'**':(details||heading).slice(0,4096),\n    ...(fields.length?{fields}:{}),\n    footer:{text:'Renovate PR Manager'},\n  };\n})($json.effect.content)) }}"
+            }
+          ]
+        }
+      },
+      "id": "35a3191c-daab-4ee1-bcd6-96e2bf06f544",
+      "name": "Send Discord notification",
+      "type": "n8n-nodes-base.discord",
+      "typeVersion": 2,
+      "alwaysOutputData": true,
+      "position": [
+        1920,
+        80
+      ],
+      "webhookId": "6c44ad0b-df4f-4cf5-8160-f8c2372172c1",
+      "onError": "continueRegularOutput",
+      "credentials": {
+        "discordWebhookApi": {
+          "id": "0sAv1OZXAxxn7np7",
+          "name": "Renovate — Discord notifications"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const s=$('Policy engine').last().json;const r=$input.first().json;\nconst pr=p=>({number:p.number,title:p.title,state:p.state,draft:p.draft,user:{login:p.user?.login},head:{sha:p.head?.sha,ref:p.head?.ref,repo:{full_name:p.head?.repo?.full_name}},html_url:p.html_url,merged:p.merged,merged_at:p.merged_at,updated_at:p.updated_at,mergeable:p.mergeable,mergeable_state:p.mergeable_state});\nlet body=r.body;const path=s.effect.path;\nif(r.statusCode<400){\n if(/\\/pulls\\?/.test(path))body=body.map(pr);\n else if(/\\/pulls\\/\\d+$/.test(path))body=pr(body);\n else if(path.includes('/reviews?'))body=body.map(x=>({id:x.id,user:{login:x.user?.login},state:x.state,commit_id:x.commit_id}));\n else if(path.includes('/check-runs?'))body={check_runs:body.check_runs.map(x=>({id:x.id,name:x.name,app:{id:x.app?.id,slug:x.app?.slug},status:x.status,conclusion:x.conclusion}))};\n else if(path.includes('/statuses?'))body=body.map(x=>({context:x.context,state:x.state}));\n else if(path.includes('/actions/runs?'))body={workflow_runs:body.workflow_runs.map(x=>({id:x.id,workflow_id:x.workflow_id,event:x.event,head_sha:x.head_sha,head_branch:x.head_branch,pull_requests:x.pull_requests?.map(p=>({number:p.number})),status:x.status,conclusion:x.conclusion,run_attempt:x.run_attempt,name:x.name,html_url:x.html_url}))};\n else if(path==='/repos/'+s.args.repository)body={default_branch:body.default_branch};\n}\ns.log.push({effect:s.effect,response:r.error?{error:true,safeMessage:'GitHub transport error; inspect execution and repository state'}:{statusCode:r.statusCode,body,safeMessage:r.statusCode>=400?'GitHub '+s.effect.method+' '+path+': '+r.statusCode+' '+(r.body?.message||''):undefined}});return [{json:s}];"
+      },
+      "id": "a1c3bc3c-4154-4986-a81f-51a7d40a6556",
+      "name": "Record GitHub response",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2288,
+        320
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const s=$('Policy engine').last().json;const r=$input.first().json;s.log.push({effect:s.effect,response:r.error?{error:true,safeMessage:'Discord delivery failed; retained in outbox'}:{statusCode:200,body:{delivered:true}}});return [{json:s}];"
+      },
+      "id": "f881af72-2048-4ee5-b90a-f1b25eda60d7",
+      "name": "Record Discord response",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2160,
+        80
+      ]
+    },
+    {
+      "parameters": {
+        "content": "## Native n8n policy worker\nA conditional Data Table update claims the repository lock. Every external action is preceded by a durable state checkpoint. The policy engine selects the next GitHub or Discord action; native nodes perform it.\n\nLocks never expire automatically. After a crash, first confirm the execution has stopped, inspect pendingMerge/retry intents, then clear lockOwner in the state table. Do not clear a live execution’s lock.\n\nDry runs perform GitHub reads only; no approvals, retries, merges, deletions, or Discord posts.",
+        "height": 330,
+        "width": 1100
+      },
+      "id": "bbd45e9c-7303-4208-8eac-e03f70f42f27",
+      "name": "Read me",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        0,
+        -432
+      ]
+    },
+    {
+      "parameters": {
+        "method": "={{ $json.effect.method }}",
+        "url": "={{ \"https://api.github.com\" + $json.effect.path }}",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "githubAppApi",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.effect.body || {}) }}",
+        "options": {
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true,
+              "responseFormat": "json"
+            }
+          },
+          "timeout": 30000
+        }
+      },
+      "id": "02c9bdc6-cd3d-4aac-8fc1-8d1570bb9925",
+      "name": "GitHub write request",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2048,
+        480
+      ],
+      "onError": "continueRegularOutput",
+      "credentials": {
+        "githubAppApi": {
+          "id": "RenoGhAppNative1",
+          "name": "Renovate — GitHub App"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ ['POST','PUT','PATCH'].includes($json.effect.method) ? 'write' : 'read' }}",
+              "rightValue": "write",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "1cea3007-1aad-4cf9-8b68-2b1fde277065",
+      "name": "GitHub write request?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1808,
+        320
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const s=$input.first().json;\nconst base='/repos/'+s.args.repository;\nif(!s.effect.path.startsWith(base))throw new Error('Unexpected GitHub repository path');\nconst path=s.effect.path.slice(base.length);\nconst query=name=>(path.match(new RegExp('[?&]'+name+'=([^&]+)'))||[])[1];\nlet route='rest';\nif(s.effect.method==='GET'){\n if(path.startsWith('/pulls?'))route='pulls';\n else if(/^\\/pulls\\/\\d+$/.test(path))route='pull';\n else if(/^\\/pulls\\/\\d+\\/reviews\\?/.test(path))route='reviews';\n else if(path==='')route='repository';\n}\nreturn [{json:{...s,nativeGithub:{route,number:Number((path.match(/^\\/pulls\\/(\\d+)/)||[])[1]||0),page:Number(query('page')||1),state:query('state')||'open',sort:query('sort')||'created',direction:query('direction')||'desc'}}}];"
+      },
+      "id": "dc431c68-160f-4304-9f99-d9e09e32c44d",
+      "name": "Route GitHub operation",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1568,
+        624
+      ]
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.nativeGithub.route }}",
+                    "rightValue": "pulls",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "pulls"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.nativeGithub.route }}",
+                    "rightValue": "pull",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "pull"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.nativeGithub.route }}",
+                    "rightValue": "reviews",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "reviews"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.nativeGithub.route }}",
+                    "rightValue": "repository",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "repository"
+            }
+          ]
+        },
+        "options": {
+          "fallbackOutput": "extra",
+          "renameFallbackOutput": "REST operations"
+        }
+      },
+      "id": "e5ff486b-6254-442f-8ccd-592d5bd76744",
+      "name": "Native GitHub operation",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.3,
+      "position": [
+        1808,
+        784
+      ]
+    },
+    {
+      "parameters": {
+        "authentication": "githubAppApi",
+        "resource": "repository",
+        "operation": "getPullRequests",
+        "owner": {
+          "__rl": true,
+          "mode": "name",
+          "value": "={{ $json.args.repository.split(\"/\")[0] }}"
+        },
+        "repository": {
+          "__rl": true,
+          "mode": "name",
+          "value": "={{ $json.args.repository.split(\"/\")[1] }}"
+        },
+        "returnAll": true,
+        "getRepositoryPullRequestsFilters": {
+          "state": "={{ $json.nativeGithub.state }}",
+          "sort": "={{ $json.nativeGithub.sort }}",
+          "direction": "={{ $json.nativeGithub.direction }}"
+        }
+      },
+      "id": "967af77d-aeb3-431f-8bdc-91da51b29582",
+      "name": "GitHub — List pull requests",
+      "type": "n8n-nodes-base.github",
+      "typeVersion": 1.1,
+      "position": [
+        2048,
+        624
+      ],
+      "webhookId": "f8f6063e-58e5-4c67-9309-140284199e4c",
+      "onError": "continueRegularOutput",
+      "alwaysOutputData": true,
+      "credentials": {
+        "githubAppApi": {
+          "id": "RenoGhAppNative1",
+          "name": "Renovate — GitHub App"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "authentication": "githubAppApi",
+        "resource": "pullRequest",
+        "operation": "get",
+        "pullRequestNumber": "={{ $json.nativeGithub.number }}",
+        "owner": {
+          "__rl": true,
+          "mode": "name",
+          "value": "={{ $json.args.repository.split(\"/\")[0] }}"
+        },
+        "repository": {
+          "__rl": true,
+          "mode": "name",
+          "value": "={{ $json.args.repository.split(\"/\")[1] }}"
+        }
+      },
+      "id": "32799ad1-82cd-48b8-9e1a-6e37bbf053dd",
+      "name": "GitHub — Get pull request",
+      "type": "n8n-nodes-base.github",
+      "typeVersion": 1.1,
+      "position": [
+        2048,
+        784
+      ],
+      "webhookId": "73e74744-49cc-41e8-9314-3bfbc6b7d37d",
+      "onError": "continueRegularOutput",
+      "alwaysOutputData": true,
+      "credentials": {
+        "githubAppApi": {
+          "id": "RenoGhAppNative1",
+          "name": "Renovate — GitHub App"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "authentication": "githubAppApi",
+        "resource": "review",
+        "operation": "getAll",
+        "owner": {
+          "__rl": true,
+          "mode": "name",
+          "value": "={{ $json.args.repository.split(\"/\")[0] }}"
+        },
+        "repository": {
+          "__rl": true,
+          "mode": "name",
+          "value": "={{ $json.args.repository.split(\"/\")[1] }}"
+        },
+        "pullRequestNumber": "={{ $json.nativeGithub.number }}",
+        "returnAll": true
+      },
+      "id": "fd417edb-a0cc-4bda-ac54-9f3a7bb75594",
+      "name": "GitHub — List reviews",
+      "type": "n8n-nodes-base.github",
+      "typeVersion": 1.1,
+      "position": [
+        2048,
+        944
+      ],
+      "webhookId": "28321caf-8632-4402-b0e7-0da8a79c9d51",
+      "onError": "continueRegularOutput",
+      "alwaysOutputData": true,
+      "credentials": {
+        "githubAppApi": {
+          "id": "RenoGhAppNative1",
+          "name": "Renovate — GitHub App"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "authentication": "githubAppApi",
+        "resource": "repository",
+        "operation": "get",
+        "owner": {
+          "__rl": true,
+          "mode": "name",
+          "value": "={{ $json.args.repository.split(\"/\")[0] }}"
+        },
+        "repository": {
+          "__rl": true,
+          "mode": "name",
+          "value": "={{ $json.args.repository.split(\"/\")[1] }}"
+        }
+      },
+      "id": "dc070b6e-797a-48a7-a9ca-7fd47046dfb3",
+      "name": "GitHub — Get repository",
+      "type": "n8n-nodes-base.github",
+      "typeVersion": 1.1,
+      "position": [
+        2048,
+        1104
+      ],
+      "webhookId": "31575b91-5312-4ccd-b901-05110ebf611e",
+      "onError": "continueRegularOutput",
+      "alwaysOutputData": true,
+      "credentials": {
+        "githubAppApi": {
+          "id": "RenoGhAppNative1",
+          "name": "Renovate — GitHub App"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const s=$('Route GitHub operation').last().json;\nconst items=$input.all().map(i=>i.json);\nconst failure=items.find(i=>i.error);\nif(failure)return [{json:{error:true}}];\nlet body;\nif(['pulls','reviews'].includes(s.nativeGithub.route)){\n const values=items.filter(i=>i.id!==undefined);\n const start=(s.nativeGithub.page-1)*100;\n body=values.slice(start,start+100);\n}else body=items[0];\nreturn [{json:{statusCode:200,body}}];"
+      },
+      "id": "b87c45f6-8b94-4e63-a8b1-3c7edb91f8ea",
+      "name": "Normalize native GitHub response",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2288,
+        784
+      ]
+    },
+    {
+      "id": "d2041721-085a-4abf-b6f6-d8013d1608af",
+      "name": "Repository lock acquired?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        360,
+        0
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ String($json.lockOwner || '') }}",
+              "rightValue": "={{ String($execution.id) }}",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "4466778a-cd97-42c2-b8e0-2a6f8c8f5413",
+      "name": "Repository busy",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        480,
+        200
+      ],
+      "parameters": {
+        "jsCode": "const args=$('Run one repository').first().json;throw new Error('Repository '+args.repository+' is locked or its state row is missing. No external actions were performed. Inspect the state table and owning execution before clearing a lock.');"
+      }
+    }
+  ],
+  "connections": {
+    "Run one repository": {
+      "main": [
+        [
+          {
+            "node": "Claim repository lock",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Initialize policy": {
+      "main": [
+        [
+          {
+            "node": "Policy engine",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Policy engine": {
+      "main": [
+        [
+          {
+            "node": "Checkpoint durable state",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Checkpoint durable state": {
+      "main": [
+        [
+          {
+            "node": "Restore policy context",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Restore policy context": {
+      "main": [
+        [
+          {
+            "node": "Finished?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Finished?": {
+      "main": [
+        [
+          {
+            "node": "Release repository lock",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Discord notification?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Release repository lock": {
+      "main": [
+        [
+          {
+            "node": "Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Discord notification?": {
+      "main": [
+        [
+          {
+            "node": "Send Discord notification",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Route GitHub operation",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "GitHub API request": {
+      "main": [
+        [
+          {
+            "node": "Record GitHub response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Record GitHub response": {
+      "main": [
+        [
+          {
+            "node": "Policy engine",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Discord notification": {
+      "main": [
+        [
+          {
+            "node": "Record Discord response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Record Discord response": {
+      "main": [
+        [
+          {
+            "node": "Policy engine",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "GitHub write request?": {
+      "main": [
+        [
+          {
+            "node": "GitHub write request",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "GitHub API request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "GitHub write request": {
+      "main": [
+        [
+          {
+            "node": "Record GitHub response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Route GitHub operation": {
+      "main": [
+        [
+          {
+            "node": "Native GitHub operation",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Native GitHub operation": {
+      "main": [
+        [
+          {
+            "node": "GitHub — List pull requests",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "GitHub — Get pull request",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "GitHub — List reviews",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "GitHub — Get repository",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "GitHub write request?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "GitHub — List pull requests": {
+      "main": [
+        [
+          {
+            "node": "Normalize native GitHub response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "GitHub — Get pull request": {
+      "main": [
+        [
+          {
+            "node": "Normalize native GitHub response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "GitHub — List reviews": {
+      "main": [
+        [
+          {
+            "node": "Normalize native GitHub response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "GitHub — Get repository": {
+      "main": [
+        [
+          {
+            "node": "Normalize native GitHub response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalize native GitHub response": {
+      "main": [
+        [
+          {
+            "node": "Record GitHub response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Claim repository lock": {
+      "main": [
+        [
+          {
+            "node": "Repository lock acquired?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Repository lock acquired?": {
+      "main": [
+        [
+          {
+            "node": "Initialize policy",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Repository busy",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "saveExecutionProgress": false,
+    "saveManualExecutions": false,
+    "saveDataErrorExecution": "none",
+    "saveDataSuccessExecution": "none",
+    "executionTimeout": 900,
+    "executionOrder": "v1",
+    "callerPolicy": "workflowsFromSameOwner",
+    "availableInMCP": true,
+    "binaryMode": "separate"
+  },
+  "nodeGroups": [
+    {
+      "id": "repository-lock",
+      "name": "Repository lock",
+      "nodeNames": [
+        "Claim repository lock",
+        "Repository lock acquired?",
+        "Repository busy",
+        "Initialize policy"
+      ],
+      "description": "Claim the repository lock and load its persistent state."
+    },
+    {
+      "id": "policy-checkpoint",
+      "name": "Policy checkpoint",
+      "nodeNames": [
+        "Policy engine",
+        "Checkpoint durable state",
+        "Restore policy context"
+      ],
+      "description": "Select the next action and checkpoint state before performing it."
+    },
+    {
+      "id": "github-operations",
+      "name": "GitHub operations",
+      "nodeNames": [
+        "Route GitHub operation",
+        "Native GitHub operation",
+        "GitHub — List pull requests",
+        "GitHub — Get pull request",
+        "GitHub — List reviews",
+        "GitHub — Get repository",
+        "Normalize native GitHub response",
+        "GitHub write request?",
+        "GitHub API request",
+        "GitHub write request",
+        "Record GitHub response"
+      ],
+      "description": "Use native GitHub reads and authenticated REST for operations requiring explicit commit safeguards."
+    },
+    {
+      "id": "discord-delivery",
+      "name": "Discord delivery",
+      "nodeNames": [
+        "Send Discord notification",
+        "Record Discord response"
+      ],
+      "description": "Send queued notifications and retain delivery outcomes for replay."
+    },
+    {
+      "id": "completion",
+      "name": "Completion",
+      "nodeNames": [
+        "Release repository lock",
+        "Result"
+      ],
+      "description": "Release the repository lock and return the retained result."
+    }
+  ],
+  "id": "tPQQRdoM1eYit8RV",
+  "active": false
+}

@@ -1,0 +1,72 @@
+{
+  "name": "Repository configuration",
+  "nodes": [
+    {
+      "id": "1af21981-2b4c-49ae-9bc4-10bc598e752e",
+      "name": "Run one repository",
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1.1,
+      "position": [
+        0,
+        0
+      ],
+      "parameters": {
+        "inputSource": "passthrough"
+      }
+    },
+    {
+      "id": "70324823-5b66-4e90-bed3-261b3b120941",
+      "name": "Repositories — edit here",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        260,
+        0
+      ],
+      "parameters": {
+        "jsCode": "const input=$input.first().json;\nconst repositories=[{repository:'beethovenxfi/frontend-monorepo',installationId:174406233,rowId:1,renovateLogin:'renovate[bot]',mergeMethod:'merge'}];\nreturn repositories.map(r=>({json:{...r,appId:'5438684',appSlug:'renovate-pr-manager',tableId:'aFuCiR0HLh6ntj2I',mode:input.mode||'monitor',dryRun:input.dryRun!==false}}));"
+      }
+    },
+    {
+      "id": "d13b2fd1-b467-4532-9643-7df597e48ece",
+      "name": "Read me",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        0,
+        -290
+      ],
+      "parameters": {
+        "content": "## Repository settings\nEdit the Repositories node to add repositories. Install the GitHub App on each repository, then add one state row with a blank lockOwner and initial state.\n\nMerge timing is controlled only by the :15 and :45 schedule, with at most one PR per repository per run. Approval notifications are sent once per PR, including across rebases. Manual merge runs can merge immediately when eligibility checks pass.",
+        "width": 700,
+        "height": 230
+      }
+    }
+  ],
+  "connections": {
+    "Run one repository": {
+      "main": [
+        [
+          {
+            "node": "Repositories — edit here",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "saveExecutionProgress": false,
+    "saveManualExecutions": false,
+    "saveDataErrorExecution": "none",
+    "saveDataSuccessExecution": "none",
+    "executionTimeout": 900,
+    "executionOrder": "v1",
+    "callerPolicy": "workflowsFromSameOwner",
+    "availableInMCP": true
+  },
+  "nodeGroups": [],
+  "id": "ak0UEUGVpmb1v6IR",
+  "active": false
+}
